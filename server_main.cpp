@@ -6,14 +6,13 @@
 #include <cstdlib>
 #include <thread>
 #include <iostream>
-#include "MetaData.pb.h"
+#include <iomanip>
+//#include "MetaData.pb.h"
 
 // simply parsing data
 void parsingData(const std::string& str)
 {
-    bolean::ipc::MetaData md;
-    md.ParseFromString(str);
-    std::cout << md.DebugString();
+    std::cout << std::quoted(str) << std::endl;
 }
 
 int main()
@@ -35,7 +34,7 @@ int main()
         boost::asio::ip::tcp::socket socket{ ioc };
         // block until we get a connection
         acceptor.accept(socket);
-        std::cout << "new connection comes in.. \n";
+        std::cout << "new connection comes in.. " << std::endl;
         // launch session
         std::thread(
             [s = std::move(socket)]() mutable

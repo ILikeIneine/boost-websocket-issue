@@ -12,7 +12,7 @@
 #include <memory>
 #include <future>
 #include <type_traits>
-#include "StepSetter.hpp"
+//#include "StepSetter.hpp"
 #include <boost/beast/websocket/impl/stream_impl.hpp>
 
 // Detection idioms 
@@ -27,12 +27,11 @@ template<class T>
 constexpr bool valid_controller_v = valid_controller<T>::value;
 /********************************************************************/
 
-
-namespace beast = boost::beast;
-namespace http = beast::http;
+namespace beast     = boost::beast;
+namespace http      = beast::http;
 namespace websocket = beast::websocket;
-namespace net = boost::asio;
-using tcp = net::ip::tcp;
+namespace net       = boost::asio;
+using tcp           = net::ip::tcp;
 
 template<typename T >
 class HeartBeatSession : public std::enable_shared_from_this<HeartBeatSession<T> > 
@@ -57,16 +56,25 @@ private:
     int CurrentSpan();
     void ResetTimer();
 
-
-    T& owner_;
-    std::string host_;
-    std::string port_;
+    T&                          owner_;
+    std::string                 host_;
+    std::string                 port_;
     tcp::resolver::results_type hostSolvingResults_;
-    StepSetter ss_;
+    struct StepSetter {
+        void reset() { *this = {}; }
+        int  current_span() {
+            if (_span < 16'000)
+                _span *= 2;
+            return _span;
+        }
 
-    tcp::resolver resolver_;
-    websocket::stream<beast::tcp_stream> ws_;
-    beast::flat_buffer buffer_;
+      private:
+        int _span = 1;
+    } ss_;
+
+    tcp::resolver                                       resolver_;
+    std::optional<websocket::stream<beast::tcp_stream>> ws_;
+    beast::flat_buffer                                  buffer_;
 
     std::chrono::seconds heartbeatInterval_;
 };
@@ -90,27 +98,25 @@ void HeartBeatSession<T>::Run(std::string host, std::string port)
     host_ = std::move(host);
     port_ = std::move(port);
 
-    resolver_.async_resolve(host_, port_,
-        [this, self{ this->shared_from_this() }](beast::error_code ec, tcp::resolver::results_type results)
-        ->void
-    {
-        if (ec)
-        {
-            std::cout << "[Resolve]: error, " << ec.what() << std::endl;
-            return;
-        }
+    resolver_.async_resolve(
+        host_, port_,
+        [this, self{this->shared_from_this()}](
+            beast::error_code ec, tcp::resolver::results_type results) -> void {
+            std::cout << "[Resolve]: " << ec.what() << std::endl;
+            if (ec) {
+                return;
+            }
 
-        hostSolvingResults_ = results;
-        self->OnResolve();
-    });
-
+            hostSolvingResults_ = results;
+            self->OnResolve();
+        });
 }
 
 
 template <typename T>
 void HeartBeatSession<T>::OnResolve()
 {
-    beast::get_lowest_layer(ws_).expires_never();
+    beast::get_lowest_layer(*ws_).expires_never();
     AsyncConnect();
 }
 
@@ -119,11 +125,11 @@ template <typename T>
 void HeartBeatSession<T>::TryReconnect()
 {
     std::cout << "session has been disconnected, trying to reconnect...\n";
-    if(ws_.is_open())
-    {
-        ws_.close(websocket::close_code::normal);
+    if (ws_->is_open()) {
+        ws_->close(websocket::close_code::normal);
     }
-    
+    ws_.emplace(ws_->get_executor());
+
     // Exponential backoff to avoid peaking connections
     const auto this_step = CurrentSpan();
     
@@ -150,21 +156,20 @@ void HeartBeatSession<T>::ResetTimer()
 template <typename T>
 void HeartBeatSession<T>::AsyncConnect()
 {
-    beast::get_lowest_layer(ws_).async_connect(hostSolvingResults_,
-        [self{ this->shared_from_this() }](beast::error_code ec, tcp::resolver::results_type::endpoint_type ep)
-        ->void
-    {
-        if (ec)
-        {
-            std::cout << "[Connect]: error, " << ec.what() << std::endl;
-            self->TryReconnect();
-            return;
-        }
+    beast::get_lowest_layer(*ws_).async_connect(
+        hostSolvingResults_,
+        [self{this->shared_from_this()}] //
+        (beast::error_code ec, tcp::resolver::results_type::endpoint_type ep) {
+            std::cout << "[Connect]: " << ec.what() << std::endl;
+            if (ec) {
+                self->TryReconnect();
+                return;
+            }
 
-        // successfully connected
-        self->ResetTimer();
-        self->OnConnect(ep);
-    });
+            // successfully connected
+            self->ResetTimer();
+            self->OnConnect(ep);
+        });
 }
 
 
@@ -172,10 +177,10 @@ template <typename T> void HeartBeatSession<T>::OnConnect(tcp::resolver::results
 {
     std::cout << "Session Connection Established...\n";
 
-    beast::get_lowest_layer(ws_).expires_never();
+    beast::get_lowest_layer(*ws_).expires_never();
 
-    ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
-    ws_.set_option(websocket::stream_base::decorator(
+    ws_->set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
+    ws_->set_option(websocket::stream_base::decorator(
         [](websocket::request_type& req)->void
         {
             req.set(http::field::user_agent, std::string(BOOST_BEAST_VERSION_STRING) +
@@ -184,17 +189,15 @@ template <typename T> void HeartBeatSession<T>::OnConnect(tcp::resolver::results
 
     auto host = host_ + ':' + std::to_string(ep.port());
 
-    ws_.async_handshake(host, "/",
-        [self{ this->shared_from_this() }](beast::error_code ec)
-        ->void
-    {
-        if (ec)
-        {
-            std::cout << "[Handshake]: error, " << ec.what() << std::endl;
-            return;
-        }
-        self->OnHandshake();
-    });
+    ws_->async_handshake(
+        host, "/",
+        [self{this->shared_from_this()}](beast::error_code ec) -> void {
+            std::cout << "[Handshake]: " << ec.what() << std::endl;
+            if (ec) {
+                return;
+            }
+            self->OnHandshake();
+        });
 }
 
 
@@ -233,18 +236,17 @@ void HeartBeatSession<T>::AsyncWrite()
     std::string msgstr = future.get();
 
 	/********** I'm not sure if here is the problem ************/
-    ws_.async_write(net::buffer(msgstr),
-        [this, self{ this->shared_from_this() }](beast::error_code ec, std::size_t byteTransferred)
-        ->void
-    {
-        if (ec)
-        {
-            std::cout << "[Write]: error, " << ec.what() << std::endl;
-            return;
-        }
-        AsyncWrite();
-    });
-	/************************************************************/
+    ws_->async_write(
+        net::buffer(msgstr),
+        [this, self{this->shared_from_this()}](
+            beast::error_code ec, std::size_t /*byteTransferred*/) -> void {
+            std::cout << "[Write]: " << ec.what() << std::endl;
+            if (ec) {
+                return;
+            }
+            AsyncWrite();
+        });
+    /************************************************************/
 }
 
 template<typename T>
@@ -253,19 +255,19 @@ void HeartBeatSession<T>::AsyncRead()
     buffer_.consume(buffer_.size());
 
 	/********** I'm not sure if here is the problem ************/
-    ws_.async_read(buffer_,
-        [this, self{ this->shared_from_this() }](beast::error_code ec, std::size_t byteTransferred)
-        ->void
-    {
-        if (ec)
-        {
-            std::cout << "[Read]: error, " << ec.what() << std::endl;
-            TryReconnect();
-            return;
-        }
-        std::cout << "Echo: " << beast::make_printable(buffer_.data()) << std::endl;
-        AsyncRead();
-    });
+    ws_->async_read(
+        buffer_,
+        [this, self{this->shared_from_this()}](
+            beast::error_code ec, std::size_t /*byteTransferred*/) -> void {
+            std::cout << "[Read]: " << ec.what() << std::endl;
+            if (ec) {
+                TryReconnect();
+                return;
+            }
+            std::cout << "Echo: " << beast::make_printable(buffer_.data())
+                      << std::endl;
+            AsyncRead();
+        });
     /************************************************************/
 
 }
